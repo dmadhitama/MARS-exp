@@ -54,8 +54,8 @@ def prepare_mri_data_labels(data_dir, labels_dir, output_dir, test_size=0.2):
 
 
 if __name__ == "__main__":
-    mri_data_dir = "/workspace/MARS/dataset_release/features/radar/"
-    mri_labels_dir = "/workspace/MARS/dataset_release/aligned_data/pose_labels/"
-    out_dir = "/workspace/MARS/dataset_release/mri_radar_rede/"
+    mri_data_dir = "/home/ubuntu/gdrive/workspace/dataset_release/features/radar/"
+    mri_labels_dir = "/home/ubuntu/gdrive/workspace/dataset_release/aligned_data/pose_labels/"
+    out_dir = "/home/ubuntu/gdrive/workspace/dataset_release/mri_radar_rede/"
 
     prepare_mri_data_labels(mri_data_dir, mri_labels_dir, out_dir)
