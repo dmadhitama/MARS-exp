@@ -91,14 +91,14 @@ class CNN_LSTM(nn.Module):
 paper_result_list = []  
   
 # Define epochs  
-epochs = 150
+epochs = 300
 iters = 10 
 
 lstm_hidden_size = 128  # Example LSTM hidden size  
 lstm_num_layers = 2  # Example number of LSTM layers  
   
 # Define the output directory  
-output_direct = 'model_mri_pytorch-cnn_lstm/'  
+output_direct = 'model_mri_pytorch-cnn_lstm-e300/'  
 if not os.path.exists(output_direct):  
     os.makedirs(output_direct)  
   
