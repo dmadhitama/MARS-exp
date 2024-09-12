@@ -1,0 +1,11 @@
+{
+    "exclude": [
+        "**/__pycache__",
+        "**/__pycache__/**",
+        "**/blurred_videos/**",
+        "**/blurred_videos-Copy1/**",
+        "**/dataset_release/**",
+        "**/node_modules/**",
+        "**/.git/**"
+    ]
+}
