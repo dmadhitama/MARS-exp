@@ -176,12 +176,26 @@ if __name__ == "__main__":
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
     # Reduce batch size further if needed
-    batch_size = 4
+    batch_size = 256
     accumulation_steps = 4  # Accumulate gradients over 4 batches
+    # Enable pin_memory for faster data transfer to GPU
+    pin_memory = torch.cuda.is_available()
 
     # Create DataLoaders
-    train_loader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(dataset_test, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        dataset_train, 
+        batch_size=batch_size, 
+        shuffle=True,
+        pin_memory=pin_memory,
+        num_workers=16
+    )
+    test_loader = DataLoader(
+        dataset_test, 
+        batch_size=batch_size, 
+        shuffle=False,
+        pin_memory=pin_memory,
+        num_workers=16
+    )
 
     # Initialize the result array
     paper_result_list = []
