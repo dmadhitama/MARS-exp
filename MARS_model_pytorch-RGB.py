@@ -102,6 +102,7 @@ class MARSDataset(Dataset):
             transforms.Resize((128, 128)),  # Adjust size as needed
             transforms.ToTensor(),
         ])
+        self.frames = [self._preprocess_frames(f) for f in tqdm(self.frames, desc="Preprocessing frames")]
 
     def _load_data(self):
         for subject_name, data in self.data_label_dict.items():
@@ -114,18 +115,22 @@ class MARSDataset(Dataset):
             self.frames.extend(X)
             self.labels.extend(y)
 
+    def _preprocess_frames(self, frame_pair):
+        frame0 = self._read_and_transform(frame_pair[0])
+        frame1 = self._read_and_transform(frame_pair[1])
+        return torch.cat((frame0, frame1), dim=0)
+
+    def _read_and_transform(self, frame_path):
+        frame = cv2.imread(frame_path)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return self.transform(frame)
+
     def __len__(self):
         return len(self.frames)
 
     def __getitem__(self, idx):
         # read and concatenate two frames
-        frame0 = read_frame(self.frames[idx][0])
-        frame1 = read_frame(self.frames[idx][1])
-        frame0 = self.transform(frame0)
-        frame1 = self.transform(frame1)
-        frame = np.concatenate((frame0, frame1), axis=1)
-
-        frame = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+        frame = self.frames[idx]
         label = torch.from_numpy(self.labels[idx]).float()
         # reshape label from 17*3 to 51 
         label = label.view(51)
@@ -187,14 +192,16 @@ if __name__ == "__main__":
         batch_size=batch_size, 
         shuffle=True,
         pin_memory=pin_memory,
-        num_workers=16
+        num_workers=8,
+        prefetch_factor=2
     )
     test_loader = DataLoader(
         dataset_test, 
         batch_size=batch_size, 
         shuffle=False,
         pin_memory=pin_memory,
-        num_workers=16
+        num_workers=8,
+        prefetch_factor=2
     )
 
     # Initialize the result array
@@ -238,7 +245,7 @@ if __name__ == "__main__":
             train_mae = 0
             print(f"Epoch {epoch+1}/{epochs}")
             for batch_features, batch_labels in tqdm(train_loader):
-                batch_features, batch_labels = batch_features.cuda(), batch_labels.cuda() if torch.cuda.is_available() else (batch_features, batch_labels)
+                batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
                 optimizer.zero_grad()
 
                 with amp.autocast():
@@ -263,7 +270,7 @@ if __name__ == "__main__":
             print("Validation")
             with torch.no_grad():
                 for batch_features, batch_labels in tqdm(test_loader):
-                    batch_features, batch_labels = batch_features.cuda(), batch_labels.cuda() if torch.cuda.is_available() else (batch_features, batch_labels)
+                    batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
                     with amp.autocast():
                         outputs = model(batch_features)
                         val_loss += criterion(outputs, batch_labels).item()
