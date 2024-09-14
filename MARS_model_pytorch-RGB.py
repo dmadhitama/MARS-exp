@@ -9,6 +9,8 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.cuda.amp as amp
 from torchvision import transforms
+import turbojpeg
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -90,7 +92,7 @@ def parse_data_label(frames_dirs, label_path, num_workers=4):
     return data_path, label
     
 class MARSDataset(Dataset):
-    def __init__(self, label_dirs, video_dirs, num_workers=4):
+    def __init__(self, label_dirs, video_dirs, num_workers=8):
         self.data_label_dict = get_pair_path(label_dirs, video_dirs)
         self.num_workers = num_workers
         self.frames = []
@@ -102,7 +104,13 @@ class MARSDataset(Dataset):
             transforms.Resize((128, 128)),  # Adjust size as needed
             transforms.ToTensor(),
         ])
-        self.frames = [self._preprocess_frames(f) for f in tqdm(self.frames, desc="Preprocessing frames")]
+        # self.frames = [self._preprocess_frames(f) for f in tqdm(self.frames, desc="Preprocessing frames")]
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            self.frames = list(tqdm(
+                pool.imap(self._preprocess_frames, self.frames),
+                total=len(self.frames),
+                desc="Preprocessing frames"
+            ))
 
     def _load_data(self):
         for subject_name, data in self.data_label_dict.items():
@@ -134,6 +142,135 @@ class MARSDataset(Dataset):
         label = torch.from_numpy(self.labels[idx]).float()
         # reshape label from 17*3 to 51 
         label = label.view(51)
+        return frame, label
+    
+class MARSDatasetFast(Dataset):
+    def __init__(self, label_dirs, video_dirs, num_workers=8, cache_dir=None):
+        self.data_label_dict = get_pair_path(label_dirs, video_dirs)
+        self.num_workers = num_workers
+        self.frames = []
+        self.labels = []
+        self.cache_dir = cache_dir
+        self._load_data()
+
+        if self.cache_dir and os.path.exists(os.path.join(self.cache_dir, 'preprocessed_frames.npy')):
+            self.frames = np.load(os.path.join(self.cache_dir, 'preprocessed_frames.npy'), mmap_mode='r')
+        else:
+            with multiprocessing.Pool(processes=num_workers) as pool:
+                self.frames = list(tqdm(
+                    pool.imap(self._preprocess_frames, self.frames),
+                    total=len(self.frames),
+                    desc="Preprocessing frames"
+                ))
+            if self.cache_dir:
+                np.save(os.path.join(self.cache_dir, 'preprocessed_frames.npy'), self.frames)
+
+    def _load_data(self):
+        for subject_name, data in self.data_label_dict.items():
+            print(f"Processing {subject_name}")
+            frames_dirs = data["frames_dirs"]
+            label_path = data["labels_path"]
+            X, y = parse_data_label(frames_dirs, label_path, num_workers=self.num_workers)
+            if X is None or y is None:
+                continue
+            self.frames.extend(X)
+            self.labels.extend(y)
+
+    @staticmethod
+    def _preprocess_frames(frame_pair):
+        jpeg = turbojpeg.TurboJPEG()
+        frame0 = MARSDatasetFast._read_and_transform(frame_pair[0], jpeg)
+        frame1 = MARSDatasetFast._read_and_transform(frame_pair[1], jpeg)
+        return np.concatenate((frame0, frame1), axis=0)
+
+    @staticmethod
+    def _read_and_transform(frame_path, jpeg):
+        with open(frame_path, 'rb') as in_file:
+            frame = jpeg.decode(in_file.read())
+        frame = cv2.resize(frame, (128, 128))
+        return frame.transpose(2, 0, 1).astype(np.float32) / 255.0
+
+    def __len__(self):
+        return len(self.frames)
+
+    def __getitem__(self, idx):
+        frame = torch.from_numpy(self.frames[idx])
+        label = torch.from_numpy(self.labels[idx]).float().view(51)
+        return frame, label
+
+class MARSDatasetFaster(Dataset):
+    def __init__(self, label_dirs, video_dirs, num_workers=8, cache_dir=None):
+        self.data_label_dict = get_pair_path(label_dirs, video_dirs)
+        self.num_workers = num_workers
+        self.frames = []
+        self.labels = []
+        self.cache_dir = cache_dir
+        self._load_data()
+
+        if self.cache_dir:
+            preprocessed_file = os.path.join(self.cache_dir, 'preprocessed_frames.npy')
+            if os.path.exists(preprocessed_file):
+                self.frames = np.load(preprocessed_file, mmap_mode='r')
+            else:
+                self._preprocess_and_cache()
+        else:
+            self._preprocess_and_cache()
+
+    def _load_data(self):
+        for subject_name, data in self.data_label_dict.items():
+            print(f"Processing {subject_name}")
+            frames_dirs = data["frames_dirs"]
+            label_path = data["labels_path"]
+            X, y = parse_data_label(frames_dirs, label_path, num_workers=self.num_workers)
+            if X is None or y is None:
+                continue
+            self.frames.extend(X)
+            self.labels.extend(y)
+
+    def _preprocess_and_cache(self):
+        with multiprocessing.Pool(processes=self.num_workers) as pool:
+            self.frames = list(tqdm(
+                pool.imap(partial(self._preprocess_frames, target_size=(128, 128)), self.frames),
+                total=len(self.frames),
+                desc="Preprocessing frames"
+            ))
+        if self.cache_dir:
+            np.save(os.path.join(self.cache_dir, 'preprocessed_frames.npy'), self.frames)
+
+    @staticmethod
+    def _preprocess_frames(frame_pair, target_size):
+        jpeg = turbojpeg.TurboJPEG()
+        frame0 = MARSDatasetFaster._read_and_transform(frame_pair[0], jpeg, target_size)
+        frame1 = MARSDatasetFaster._read_and_transform(frame_pair[1], jpeg, target_size)
+        return np.concatenate((frame0, frame1), axis=0)
+
+    @staticmethod
+    def _read_and_transform(frame_path, jpeg, target_size):
+        with open(frame_path, 'rb') as in_file:
+            jpeg_data = in_file.read()
+            width, height, _, _ = jpeg.decode_header(jpeg_data)
+            
+            # Choose the closest supported scaling factor
+            supported_factors = {(1, 8), (1, 4), (3, 8), (1, 2), (5, 8), (3, 4), (7, 8), (1, 1),
+                                 (9, 8), (5, 4), (11, 8), (3, 2), (13, 8), (7, 4), (15, 8), (2, 1)}
+            scale_x = target_size[0] / width
+            scale_y = target_size[1] / height
+            scaling_factor = min(supported_factors, key=lambda f: abs(f[0]/f[1] - min(scale_x, scale_y)))
+            
+            frame = jpeg.decode(jpeg_data, scaling_factor=scaling_factor)
+        
+        # Resize to exact target size if necessary
+        if frame.shape[:2] != target_size:
+            frame = cv2.resize(frame, target_size)
+        
+        return frame.transpose(2, 0, 1).astype(np.float32) / 255.0
+
+    def __len__(self):
+        return len(self.frames)
+
+    def __getitem__(self, idx):
+        frame = torch.from_numpy(self.frames[idx])
+        label = torch.from_numpy(self.labels[idx]).float().view(51)
         return frame, label
     
 
@@ -170,8 +307,14 @@ if __name__ == "__main__":
     video_dirs = "/home/ubuntu/gdrive/workspace/blurred_videos/"
 
     # Create the full dataset
-    full_dataset = MARSDataset(label_dirs, video_dirs)
-    
+    # full_dataset = MARSDataset(label_dirs, video_dirs)
+    full_dataset = MARSDatasetFaster(
+        label_dirs, 
+        video_dirs, 
+        num_workers=8, 
+        cache_dir='/home/ubuntu/gdrive/workspace/blurred_videos/cache'
+    )
+
     # Split the dataset into train and test
     train_size = int(0.8 * len(full_dataset))
     test_size = len(full_dataset) - train_size
