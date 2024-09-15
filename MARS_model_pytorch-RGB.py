@@ -8,6 +8,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.cuda.amp as amp
+from torch.utils.data import Sampler
+
 from torchvision import transforms
 import turbojpeg
 from functools import partial
@@ -273,6 +275,119 @@ class MARSDatasetFaster(Dataset):
         label = torch.from_numpy(self.labels[idx]).float().view(51)
         return frame, label
     
+class MARSDatasetChunked(Dataset):
+    def __init__(self, label_dirs, video_dirs, num_workers=8, cache_dir=None, chunk_size=1000):
+        self.data_label_dict = get_pair_path(label_dirs, video_dirs)
+        self.num_workers = num_workers
+        self.cache_dir = cache_dir
+        self.chunk_size = chunk_size
+        self.frames = []
+        self.labels = []
+        self._load_data()
+
+        if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            self.preprocessed_file = os.path.join(self.cache_dir, 'preprocessed_frames.npy')
+            if not os.path.exists(self.preprocessed_file):
+                self._preprocess_and_cache()
+            try:
+                self.frames = np.memmap(self.preprocessed_file, dtype='float32', mode='r', shape=(len(self.frames), 6, 128, 128))
+            except Exception as e:
+                print(f"Error loading memmap: {e}")
+                print("Falling back to in-memory processing")
+                self._preprocess_and_cache()
+        else:
+            self._preprocess_and_cache()
+
+        print(f"Total frames: {len(self.frames)}")
+        print(f"Total labels: {len(self.labels)}")
+
+    def _load_data(self):
+        for subject_name, data in self.data_label_dict.items():
+            print(f"Processing {subject_name}")
+            frames_dirs = data["frames_dirs"]
+            label_path = data["labels_path"]
+            X, y = parse_data_label(frames_dirs, label_path, num_workers=self.num_workers)
+            if X is None or y is None:
+                continue
+            self.frames.extend(X)
+            self.labels.extend(y)
+
+        print(f"Loaded {len(self.frames)} frames and {len(self.labels)} labels")
+
+    def _preprocess_and_cache(self):
+        total_frames = len(self.frames)
+        shape = (total_frames, 6, 128, 128)
+        
+        if self.cache_dir:
+            try:
+                frames_mmap = np.memmap(self.preprocessed_file, dtype='float32', mode='w+', shape=shape)
+            except Exception as e:
+                print(f"Error creating memmap: {e}")
+                print("Falling back to in-memory processing")
+                frames_mmap = np.zeros(shape, dtype='float32')
+        else:
+            frames_mmap = np.zeros(shape, dtype='float32')
+
+        with multiprocessing.Pool(processes=self.num_workers) as pool:
+            for chunk_start in range(0, total_frames, self.chunk_size):
+                chunk_end = min(chunk_start + self.chunk_size, total_frames)
+                chunk = self.frames[chunk_start:chunk_end]
+                preprocessed_chunk = list(tqdm(
+                    pool.imap(partial(self._preprocess_frames, target_size=(128, 128)), chunk),
+                    total=len(chunk),
+                    desc=f"Preprocessing frames {chunk_start}-{chunk_end}"
+                ))
+                frames_mmap[chunk_start:chunk_end] = preprocessed_chunk
+
+        if self.cache_dir:
+            try:
+                frames_mmap.flush()
+            except Exception as e:
+                print(f"Error flushing memmap: {e}")
+        
+        self.frames = frames_mmap
+
+    @staticmethod
+    def _preprocess_frames(frame_pair, target_size):
+        jpeg = turbojpeg.TurboJPEG()
+        frame0 = MARSDatasetChunked._read_and_transform(frame_pair[0], jpeg, target_size)
+        frame1 = MARSDatasetChunked._read_and_transform(frame_pair[1], jpeg, target_size)
+        return np.concatenate((frame0, frame1), axis=0)
+
+    @staticmethod
+    def _read_and_transform(frame_path, jpeg, target_size):
+        with open(frame_path, 'rb') as in_file:
+            frame = jpeg.decode(in_file.read())
+        frame = cv2.resize(frame, target_size)
+        return frame.transpose(2, 0, 1).astype(np.float32) / 255.0
+
+    def __len__(self):
+        return len(self.frames)
+
+    def __getitem__(self, idx):
+        if idx >= len(self.frames):
+            raise IndexError(f"Index {idx} is out of bounds for dataset with {len(self.frames)} items")
+        
+        frame = torch.from_numpy(self.frames[idx])
+        label = torch.from_numpy(self.labels[idx]).float().view(51)
+        return frame, label
+
+class ChunkSampler(Sampler):
+    def __init__(self, data_source, chunk_size):
+        self.data_source = data_source
+        self.chunk_size = chunk_size
+        self.num_samples = len(data_source)
+
+    def __iter__(self):
+        indices = list(range(self.num_samples))
+        np.random.shuffle(indices)
+        for i in range(0, self.num_samples, self.chunk_size):
+            yield from indices[i:min(i + self.chunk_size, self.num_samples)]
+
+    def __len__(self):
+        return self.num_samples
+    
 
 # Define the CNN model  
 class CNN(nn.Module):  
@@ -305,27 +420,41 @@ class CNN(nn.Module):
 if __name__ == "__main__":
     label_dirs = "/home/ubuntu/gdrive/workspace/dataset_release/aligned_data/pose_labels/"
     video_dirs = "/home/ubuntu/gdrive/workspace/blurred_videos/"
+    cache_dir = '/home/ubuntu/MARS-cache'
+
+    # Set PYTORCH_CUDA_ALLOC_CONF
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+    # Reduce batch size further if needed
+    batch_size = 200
+    accumulation_steps = 4  # Accumulate gradients over 4 batches
+
+    chunk_size = 1000
+
+    # Define epochs and iterations
+    epochs = 100
+    iters = 5
 
     # Create the full dataset
     # full_dataset = MARSDataset(label_dirs, video_dirs)
-    full_dataset = MARSDatasetFaster(
+    # full_dataset = MARSDatasetFaster(
+    #     label_dirs, 
+    #     video_dirs, 
+    #     num_workers=8, 
+    #     cache_dir='/home/ubuntu/gdrive/workspace/blurred_videos/cache'
+    # )
+    full_dataset = MARSDatasetChunked(
         label_dirs, 
         video_dirs, 
         num_workers=8, 
-        cache_dir='/home/ubuntu/gdrive/workspace/blurred_videos/cache'
+        cache_dir=cache_dir,
+        chunk_size=chunk_size
     )
 
     # Split the dataset into train and test
     train_size = int(0.8 * len(full_dataset))
     test_size = len(full_dataset) - train_size
     dataset_train, dataset_test = torch.utils.data.random_split(full_dataset, [train_size, test_size])
-
-    # Set PYTORCH_CUDA_ALLOC_CONF
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
-    # Reduce batch size further if needed
-    batch_size = 256
-    accumulation_steps = 4  # Accumulate gradients over 4 batches
     # Enable pin_memory for faster data transfer to GPU
     pin_memory = torch.cuda.is_available()
 
@@ -333,26 +462,24 @@ if __name__ == "__main__":
     train_loader = DataLoader(
         dataset_train, 
         batch_size=batch_size, 
-        shuffle=True,
+        # shuffle=True,
         pin_memory=pin_memory,
         num_workers=8,
-        prefetch_factor=2
+        prefetch_factor=2,
+        sampler=ChunkSampler(dataset_train, chunk_size)
     )
     test_loader = DataLoader(
         dataset_test, 
         batch_size=batch_size, 
-        shuffle=False,
+        # shuffle=False,
         pin_memory=pin_memory,
         num_workers=8,
-        prefetch_factor=2
+        prefetch_factor=2,
+        sampler=ChunkSampler(dataset_test, chunk_size)
     )
 
     # Initialize the result array
     paper_result_list = []
-
-    # Define epochs and iterations
-    epochs = 150
-    iters = 10
 
     # Define the output directory
     output_direct = 'model_mri_pytorch-RGB/'
@@ -362,8 +489,8 @@ if __name__ == "__main__":
     n_keypoints = 51  # Assuming 17 keypoints with x, y, z coordinates
 
     # Repeat i iteration to get the average result
-    for i in range(iters):
-        print(f"Iteration {i}")
+    for iter in range(iters):
+        print(f"Iteration {iter}")
         # Instantiate the model
         model = CNN(dataset_train[0][0].shape, n_keypoints)
         model = model.cuda() if torch.cuda.is_available() else model
@@ -371,7 +498,7 @@ if __name__ == "__main__":
         score_min = float('inf')
 
         # Define optimizer and loss function
-        optimizer = optim.Adam(model.parameters(), lr=0.001, betas=(0.5, 0.999))
+        optimizer = optim.Adam(model.parameters(), lr=0.0001)#, betas=(0.5, 0.999))
         criterion = nn.MSELoss()
         scaler = amp.GradScaler()
 
@@ -387,17 +514,20 @@ if __name__ == "__main__":
             train_loss = 0
             train_mae = 0
             print(f"Epoch {epoch+1}/{epochs}")
-            for batch_features, batch_labels in tqdm(train_loader):
+            for i, (batch_features, batch_labels) in enumerate(tqdm(train_loader)):
                 batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
-                optimizer.zero_grad()
 
                 with amp.autocast():
                     outputs = model(batch_features)
                     loss = criterion(outputs, batch_labels)
 
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                
+                if (i + 1) % accumulation_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+
                 train_loss += loss.item()
                 train_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
 
@@ -458,7 +588,7 @@ if __name__ == "__main__":
         plt.xlabel('Epoch')  
         plt.grid()  
         plt.legend(['Train', 'Validation'], loc='upper left')  
-        plt.savefig(output_direct + f"/acc-{i}.png")  
+        plt.savefig(output_direct + f"/acc-{iter}.png")  
     
         # Plot loss  
         plt.figure(figsize=(10, 10))  
@@ -469,7 +599,11 @@ if __name__ == "__main__":
         plt.xlabel('Epoch')  
         plt.grid()  
         plt.legend(['Train', 'Validation'], loc='upper left')  
-        plt.savefig(output_direct + f"/loss-{i}.png")  
+        plt.savefig(output_direct + f"/loss-{iter}.png")  
+
+        # Before calculating metrics, move tensors to CPU and convert to NumPy arrays
+        batch_labels = batch_labels.cpu().numpy()
+        outputs = outputs.cpu().numpy()
     
         # Error for each axis  
         print("mae for x is", metrics.mean_absolute_error(batch_labels[:, 0:17], outputs[:, 0:17]))  
