@@ -1,0 +1,1 @@
+2024/09/15 06:51:51 ERROR : /home/ubuntu/gdrive/: Failed to unmount: exit status 1: fusermount3: failed to unmount /home/ubuntu/gdrive: Device or resource busy
