@@ -429,23 +429,31 @@ class CNN(nn.Module):
         x = self.fc_dropout(x)  
         x = self.fc2(x)  
         return x  
+    
+def custom_collate(batch):
+    frames, labels = zip(*batch)
+    frames = torch.stack(frames).float()
+    labels = torch.stack(labels).float()
+    return frames, labels
 
 
 if __name__ == "__main__":
     label_dirs = "/home/ubuntu/gdrive/workspace/dataset_release/aligned_data/pose_labels/"
     video_dirs = "/home/ubuntu/gdrive/workspace/blurred_videos/"
-    cache_dir = '/home/ubuntu/MARS-cache'
+    cache_dir = '/home/ubuntu/MARS-cache-npy'
     output_direct = 'model_mri_pytorch-RGB-e150-160/'
 
     # Set PYTORCH_CUDA_ALLOC_CONF
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
     # Reduce batch size further if needed
-    batch_size = 256
+    batch_size = 128
     accumulation_steps = 4  # Accumulate gradients over 4 batches
-    target_size = (140, 140)
+    target_size = (160, 160) 
 
     chunk_size = 1000
+    num_workers = 8
+    prefetch_factor = 4
 
     # Define epochs and iterations
     epochs = 150
@@ -462,7 +470,7 @@ if __name__ == "__main__":
     full_dataset = MARSDatasetChunked(
         label_dirs, 
         video_dirs, 
-        num_workers=8, 
+        num_workers=num_workers, 
         cache_dir=cache_dir,
         chunk_size=chunk_size,
         target_size=target_size
@@ -472,27 +480,27 @@ if __name__ == "__main__":
     train_size = int(0.8 * len(full_dataset))
     test_size = len(full_dataset) - train_size
     dataset_train, dataset_test = torch.utils.data.random_split(full_dataset, [train_size, test_size])
-    # Enable pin_memory for faster data transfer to GPU
-    pin_memory = torch.cuda.is_available()
 
     # Create DataLoaders
     train_loader = DataLoader(
         dataset_train, 
         batch_size=batch_size, 
-        # shuffle=True,
-        pin_memory=pin_memory,
-        num_workers=8,
-        prefetch_factor=2,
-        sampler=ChunkSampler(dataset_train, chunk_size)
+        pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True,
+        sampler=ChunkSampler(dataset_train, chunk_size),
+        collate_fn=custom_collate
     )
     test_loader = DataLoader(
         dataset_test, 
         batch_size=batch_size, 
-        # shuffle=False,
-        pin_memory=pin_memory,
-        num_workers=8,
-        prefetch_factor=2,
-        sampler=ChunkSampler(dataset_test, chunk_size)
+        pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True,
+        sampler=ChunkSampler(dataset_test, chunk_size),
+        collate_fn=custom_collate
     )
 
     # Initialize the result array
@@ -530,47 +538,52 @@ if __name__ == "__main__":
             train_loss = 0
             train_mae = 0
             print(f"Epoch {epoch+1}/{epochs}")
-            for i, (batch_features, batch_labels) in enumerate(tqdm(train_loader)):
-                batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
-
-                with amp.autocast():
-                    outputs = model(batch_features)
-                    loss = criterion(outputs, batch_labels)
-
-                scaler.scale(loss).backward()
-                
-                if (i + 1) % accumulation_steps == 0:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-
-                train_loss += loss.item()
-                train_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
-
-            train_loss /= len(train_loader)
-            train_mae /= len(train_loader)
-            train_loss_history.append(train_loss)
-            train_mae_history.append(train_mae)
-
-            # Validation loop (using test set as validation)
-            model.eval()
-            val_loss = 0
-            val_mae = 0
-            print("Validation")
-            with torch.no_grad():
-                for batch_features, batch_labels in tqdm(test_loader):
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                for i, (batch_features, batch_labels) in enumerate(tqdm(train_loader)):
                     batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
+        
                     with amp.autocast():
                         outputs = model(batch_features)
-                        val_loss += criterion(outputs, batch_labels).item()
-                        val_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
+                        loss = criterion(outputs, batch_labels)
 
-            val_loss /= len(test_loader)
-            val_mae /= len(test_loader)
-            val_loss_history.append(val_loss)
-            val_mae_history.append(val_mae)
-            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Train MAE: {train_mae:.4f}, Validation MAE: {val_mae:.4f}')
-             
+                    scaler.scale(loss).backward()
+                    
+                    if (i + 1) % accumulation_steps == 0:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+
+                    train_loss += loss.item()
+                    train_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
+
+                train_loss /= len(train_loader)
+                train_mae /= len(train_loader)
+                train_loss_history.append(train_loss)
+                train_mae_history.append(train_mae)
+
+                # Validation loop (using test set as validation)
+                model.eval()
+                val_loss = 0
+                val_mae = 0
+                print("Validation")
+                with torch.no_grad():
+                    for batch_features, batch_labels in tqdm(test_loader):
+                        batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
+                        with amp.autocast():
+                            outputs = model(batch_features)
+                            val_loss += criterion(outputs, batch_labels).item()
+                            val_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
+
+                val_loss /= len(test_loader)
+                val_mae /= len(test_loader)
+                val_loss_history.append(val_loss)
+                val_mae_history.append(val_mae)
+                print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Train MAE: {train_mae:.4f}, Validation MAE: {val_mae:.4f}')
+                
+                torch.cuda.synchronize()
+                if epoch % 5 == 0:
+                    torch.cuda.empty_cache()
   
         # Save and print the metrics  
         model.eval()  

@@ -101,8 +101,7 @@ class MARSDatasetChunked(Dataset):
             num_workers=8, 
             cache_dir=None, 
             chunk_size=1000,
-            target_size=(128, 128),  # Reduced size
-            dtype=np.float16  # Lower precision
+            target_size=(128, 128)
         ):
         self.data_label_dict = get_pair_path(label_dirs, video_dirs)
         self.num_workers = num_workers
@@ -112,18 +111,21 @@ class MARSDatasetChunked(Dataset):
         self.labels = []
         self._load_data()
         self.target_size = target_size
-        self.dtype = dtype
 
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
-            self.preprocessed_file = os.path.join(self.cache_dir, 'preprocessed_frames.npz')
+            self.preprocessed_file = os.path.join(self.cache_dir, 'preprocessed_frames_gray.npy')
             if not os.path.exists(self.preprocessed_file):
                 self._preprocess_and_cache()
             try:
-                with np.load(self.preprocessed_file, mmap_mode='r') as data:
-                    self.frames = data['frames']
+                self.frames = np.memmap(
+                    self.preprocessed_file, 
+                    dtype='float32', 
+                    mode='r', 
+                    shape=(len(self.frames), 2, self.target_size[0], self.target_size[1])
+                )
             except Exception as e:
-                print(f"Error loading npz: {e}")
+                print(f"Error loading memmap: {e}")
                 print("Falling back to in-memory processing")
                 self._preprocess_and_cache()
         else:
@@ -131,7 +133,6 @@ class MARSDatasetChunked(Dataset):
 
         print(f"Total frames: {len(self.frames)}")
         print(f"Total labels: {len(self.labels)}")
-
 
     def _load_data(self):
         for subject_name, data in self.data_label_dict.items():
@@ -146,79 +147,61 @@ class MARSDatasetChunked(Dataset):
 
         print(f"Loaded {len(self.frames)} frames and {len(self.labels)} labels")
 
-    @staticmethod
-    def _preprocess_frames(frame_pair, target_size, dtype):
-        jpeg = turbojpeg.TurboJPEG()
-        frame0 = MARSDatasetChunked._read_and_transform(frame_pair[0], jpeg, target_size, dtype)
-        frame1 = MARSDatasetChunked._read_and_transform(frame_pair[1], jpeg, target_size, dtype)
-        return np.concatenate((frame0, frame1), axis=0)
-
-    @staticmethod
-    def _read_and_transform(frame_path, jpeg, target_size, dtype):
-        with open(frame_path, 'rb') as in_file:
-            frame = jpeg.decode(in_file.read())
-        frame = cv2.resize(frame, target_size)
-        return frame.transpose(2, 0, 1).astype(dtype) / 255.0
-
     def _preprocess_and_cache(self):
         total_frames = len(self.frames)
-        chunk_size = min(10000, total_frames)  # Process 10000 frames at a time, or less if total_frames is smaller
+        shape = (total_frames, 2, self.target_size[0], self.target_size[1])
         
         if self.cache_dir:
-            if os.path.exists(self.preprocessed_file):
-                print(f"Loading preprocessed data from {self.preprocessed_file}")
-                with np.load(self.preprocessed_file, mmap_mode='r') as data:
-                    self.frames = data['frames']
-                return
+            try:
+                frames_mmap = np.memmap(self.preprocessed_file, dtype='float32', mode='w+', shape=shape)
+            except Exception as e:
+                print(f"Error creating memmap: {e}")
+                print("Falling back to in-memory processing")
+                frames_mmap = np.zeros(shape, dtype='float32')
+        else:
+            frames_mmap = np.zeros(shape, dtype='float32')
 
-        print("Preprocessing and caching data...")
-        processed_frames = []
-        
         with multiprocessing.Pool(processes=self.num_workers) as pool:
-            for chunk_start in range(0, total_frames, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, total_frames)
+            for chunk_start in range(0, total_frames, self.chunk_size):
+                chunk_end = min(chunk_start + self.chunk_size, total_frames)
                 chunk = self.frames[chunk_start:chunk_end]
-                
                 preprocessed_chunk = list(tqdm(
-                    pool.imap(partial(self._preprocess_frames, target_size=self.target_size, dtype=self.dtype), chunk),
+                    pool.imap(partial(self._preprocess_frames, target_size=self.target_size), chunk),
                     total=len(chunk),
                     desc=f"Preprocessing frames {chunk_start}-{chunk_end}"
                 ))
-                
-                processed_frames.extend(preprocessed_chunk)
-                
-                # Save intermediate results
-                if self.cache_dir and (chunk_end == total_frames or len(processed_frames) >= 50000):
-                    temp_file = os.path.join(self.cache_dir, f'temp_preprocessed_frames_{chunk_start}.npz')
-                    np.savez_compressed(temp_file, frames=np.array(processed_frames, dtype=self.dtype))
-                    processed_frames = []  # Clear processed_frames to free up memory
-        
-        # Combine all temporary files into one
-        if self.cache_dir:
-            temp_files = [f for f in os.listdir(self.cache_dir) if f.startswith('temp_preprocessed_frames_')]
-            combined_frames = []
-            for temp_file in temp_files:
-                with np.load(os.path.join(self.cache_dir, temp_file)) as data:
-                    combined_frames.append(data['frames'])
-            
-            final_frames = np.concatenate(combined_frames)
-            np.savez_compressed(self.preprocessed_file, frames=final_frames)
-            
-            # Remove temporary files
-            for temp_file in temp_files:
-                os.remove(os.path.join(self.cache_dir, temp_file))
-            
-            self.frames = final_frames
-        else:
-            self.frames = np.array(processed_frames, dtype=self.dtype)
+                frames_mmap[chunk_start:chunk_end] = preprocessed_chunk
 
-        print(f"Preprocessing complete. Cached data saved to {self.preprocessed_file}")
+        if self.cache_dir:
+            try:
+                frames_mmap.flush()
+            except Exception as e:
+                print(f"Error flushing memmap: {e}")
+        
+        self.frames = frames_mmap
+
+    @staticmethod
+    def _preprocess_frames(frame_pair, target_size):
+        jpeg = turbojpeg.TurboJPEG()
+        frame0 = MARSDatasetChunked._read_and_transform(frame_pair[0], jpeg, target_size)
+        frame1 = MARSDatasetChunked._read_and_transform(frame_pair[1], jpeg, target_size)
+        return np.concatenate((frame0, frame1), axis=0)
+
+    @staticmethod
+    def _read_and_transform(frame_path, jpeg, target_size):
+        with open(frame_path, 'rb') as in_file:
+            frame = jpeg.decode(in_file.read(), pixel_format=turbojpeg.TJPF_GRAY)
+        frame = cv2.resize(frame, target_size)
+        return frame.reshape(1, *target_size).astype(np.float32) / 255.0
+
+    def __len__(self):
+        return len(self.frames)
 
     def __getitem__(self, idx):
         if idx >= len(self.frames):
             raise IndexError(f"Index {idx} is out of bounds for dataset with {len(self.frames)} items")
         
-        frame = torch.from_numpy(self.frames[idx].astype(np.float32))
+        frame = torch.from_numpy(self.frames[idx])
         label = torch.from_numpy(self.labels[idx]).float().view(51)
         return frame, label
 
@@ -264,64 +247,78 @@ class CNN(nn.Module):
         x = self.fc_dropout(x)  
         x = self.fc2(x)  
         return x  
+    
+def custom_collate(batch):
+    frames, labels = zip(*batch)
+    frames = torch.stack(frames).float()
+    labels = torch.stack(labels).float()
+    return frames, labels
 
 
 if __name__ == "__main__":
     label_dirs = "/home/ubuntu/gdrive/workspace/dataset_release/aligned_data/pose_labels/"
     video_dirs = "/home/ubuntu/gdrive/workspace/blurred_videos/"
-    cache_dir = '/home/ubuntu/MARS-cache'
-    output_direct = 'model_mri_pytorch-RGB-e150-160/'
+    cache_dir = '/home/ubuntu/MARS-cache-npy'
+    output_direct = 'model_mri_pytorch-RGB-Gray-e150-160/'
 
     # Set PYTORCH_CUDA_ALLOC_CONF
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
     # Reduce batch size further if needed
     batch_size = 128
     accumulation_steps = 4  # Accumulate gradients over 4 batches
-    target_size = (160, 160)
+    target_size = (160, 160) 
 
     chunk_size = 1000
+    num_workers = 8
+    prefetch_factor = 4
 
     # Define epochs and iterations
-    epochs = 150
-    iters = 5
+    epochs = 200
+    iters = 1
 
     # Create the full dataset
+    # full_dataset = MARSDataset(label_dirs, video_dirs)
+    # full_dataset = MARSDatasetFaster(
+    #     label_dirs, 
+    #     video_dirs, 
+    #     num_workers=8, 
+    #     cache_dir='/home/ubuntu/gdrive/workspace/blurred_videos/cache'
+    # )
     full_dataset = MARSDatasetChunked(
         label_dirs, 
         video_dirs, 
-        num_workers=8, 
+        num_workers=num_workers, 
         cache_dir=cache_dir,
         chunk_size=chunk_size,
-        target_size=target_size,
-        dtype=np.float32
+        target_size=target_size
     )
 
     # Split the dataset into train and test
     train_size = int(0.8 * len(full_dataset))
     test_size = len(full_dataset) - train_size
     dataset_train, dataset_test = torch.utils.data.random_split(full_dataset, [train_size, test_size])
-    # Enable pin_memory for faster data transfer to GPU
-    pin_memory = torch.cuda.is_available()
 
     # Create DataLoaders
     train_loader = DataLoader(
         dataset_train, 
         batch_size=batch_size, 
-        # shuffle=True,
-        pin_memory=pin_memory,
-        num_workers=8,
-        prefetch_factor=2,
-        sampler=ChunkSampler(dataset_train, chunk_size)
+        pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True,
+        sampler=ChunkSampler(dataset_train, chunk_size),
+        collate_fn=custom_collate
     )
     test_loader = DataLoader(
         dataset_test, 
         batch_size=batch_size, 
-        # shuffle=False,
-        pin_memory=pin_memory,
-        num_workers=8,
-        prefetch_factor=2,
-        sampler=ChunkSampler(dataset_test, chunk_size)
+        pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True,
+        sampler=ChunkSampler(dataset_test, chunk_size),
+        collate_fn=custom_collate
     )
 
     # Initialize the result array
@@ -359,47 +356,52 @@ if __name__ == "__main__":
             train_loss = 0
             train_mae = 0
             print(f"Epoch {epoch+1}/{epochs}")
-            for i, (batch_features, batch_labels) in enumerate(tqdm(train_loader)):
-                batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
-
-                with amp.autocast():
-                    outputs = model(batch_features)
-                    loss = criterion(outputs, batch_labels)
-
-                scaler.scale(loss).backward()
-                
-                if (i + 1) % accumulation_steps == 0:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-
-                train_loss += loss.item()
-                train_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
-
-            train_loss /= len(train_loader)
-            train_mae /= len(train_loader)
-            train_loss_history.append(train_loss)
-            train_mae_history.append(train_mae)
-
-            # Validation loop (using test set as validation)
-            model.eval()
-            val_loss = 0
-            val_mae = 0
-            print("Validation")
-            with torch.no_grad():
-                for batch_features, batch_labels in tqdm(test_loader):
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                for i, (batch_features, batch_labels) in enumerate(tqdm(train_loader)):
                     batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
+        
                     with amp.autocast():
                         outputs = model(batch_features)
-                        val_loss += criterion(outputs, batch_labels).item()
-                        val_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
+                        loss = criterion(outputs, batch_labels)
 
-            val_loss /= len(test_loader)
-            val_mae /= len(test_loader)
-            val_loss_history.append(val_loss)
-            val_mae_history.append(val_mae)
-            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Train MAE: {train_mae:.4f}, Validation MAE: {val_mae:.4f}')
-             
+                    scaler.scale(loss).backward()
+                    
+                    if (i + 1) % accumulation_steps == 0:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+
+                    train_loss += loss.item()
+                    train_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
+
+                train_loss /= len(train_loader)
+                train_mae /= len(train_loader)
+                train_loss_history.append(train_loss)
+                train_mae_history.append(train_mae)
+
+                # Validation loop (using test set as validation)
+                model.eval()
+                val_loss = 0
+                val_mae = 0
+                print("Validation")
+                with torch.no_grad():
+                    for batch_features, batch_labels in tqdm(test_loader):
+                        batch_features, batch_labels = batch_features.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_features, batch_labels)
+                        with amp.autocast():
+                            outputs = model(batch_features)
+                            val_loss += criterion(outputs, batch_labels).item()
+                            val_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
+
+                val_loss /= len(test_loader)
+                val_mae /= len(test_loader)
+                val_loss_history.append(val_loss)
+                val_mae_history.append(val_mae)
+                print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Train MAE: {train_mae:.4f}, Validation MAE: {val_mae:.4f}')
+                
+                torch.cuda.synchronize()
+                if epoch % 5 == 0:
+                    torch.cuda.empty_cache()
   
         # Save and print the metrics  
         model.eval()  
