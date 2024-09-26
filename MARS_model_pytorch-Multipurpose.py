@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.cuda.amp as amp
 from torch.utils.data import Sampler
+import torch.nn.functional as F
 
 from torchvision import transforms
 import turbojpeg
@@ -19,6 +20,7 @@ import pandas as pd
 import torch.optim as optim
 from sklearn import metrics
 import matplotlib.pyplot as plt
+import json
 
 def read_frame(frame_path):
     return cv2.imread(frame_path)
@@ -124,12 +126,12 @@ class MARSDatasetChunked(Dataset):
         self.num_workers = num_workers
         self.cache_dir = cache_dir
         self.chunk_size = chunk_size
+        self.target_size = target_size
+        self.radar_size = radar_size
         self.frames = []
         self.radar = []
         self.labels = []
         self._load_data() # load data into memory
-        self.target_size = target_size
-        self.radar_size = radar_size
 
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -173,6 +175,7 @@ class MARSDatasetChunked(Dataset):
         print(f"Total frames: {len(self.frames)}")
         print(f"Total labels: {len(self.labels)}")
         print(f"Total radar: {len(self.radar)}")
+
     def _load_data(self):
         for subject_name, data in self.data_label_dict.items():
             print(f"Processing {subject_name}")
@@ -204,13 +207,30 @@ class MARSDatasetChunked(Dataset):
         else:
             radar_mmap = np.zeros(shape, dtype='float32')
 
+        # Calculate global min and max values
+        global_min = float('inf')
+        global_max = float('-inf')
+
+        for chunk_start in range(0, total_frames_radar, self.chunk_size):
+            chunk_end = min(chunk_start + self.chunk_size, total_frames_radar)
+            chunk = self.radar[chunk_start:chunk_end]
+            chunk = np.array(chunk).reshape(-1, self.radar_size[0], self.radar_size[1], self.radar_size[2])
+            global_min = min(global_min, np.min(chunk))
+            global_max = max(global_max, np.max(chunk))
+
+        print(f"Global min: {global_min}, Global max: {global_max}")
+
+        # Normalize and store the data
         for chunk_start in range(0, total_frames_radar, self.chunk_size):
             chunk_end = min(chunk_start + self.chunk_size, total_frames_radar)
             print(f"Processing radar chunk {chunk_start}-{chunk_end}")
             chunk = self.radar[chunk_start:chunk_end]
-            # Reshape or convert if necessary
             chunk = np.array(chunk).reshape(-1, self.radar_size[0], self.radar_size[1], self.radar_size[2]).astype(np.float32)
-            radar_mmap[chunk_start:chunk_end] = chunk
+            
+            # Normalize to 0-1 range
+            chunk_normalized = (chunk - global_min) / (global_max - global_min)
+            
+            radar_mmap[chunk_start:chunk_end] = chunk_normalized
 
         if self.cache_dir:
             try:
@@ -275,9 +295,16 @@ class MARSDatasetChunked(Dataset):
         if idx >= len(self.frames):
             raise IndexError(f"Index {idx} is out of bounds for dataset with {len(self.frames)} items")
         
-        frame = torch.from_numpy(self.frames[idx])
-        radar = torch.from_numpy(self.radar[idx])
+         # Make a copy of the frame data
+        frame = np.array(self.frames[idx])
+        frame = torch.from_numpy(frame).float()
+        
+        # Make a copy of the radar data
+        radar = np.array(self.radar[idx])
+        radar = torch.from_numpy(radar).float()
+        
         label = torch.from_numpy(self.labels[idx]).float().view(51)
+
         return frame, radar, label
 
 class ChunkSampler(Sampler):
@@ -295,11 +322,40 @@ class ChunkSampler(Sampler):
     def __len__(self):
         return self.num_samples
     
+# Define the single modal CNN model  
+class CNNSingleInput(nn.Module):  
+    def __init__(self, in_shape, n_keypoints):  
+        super(CNNSingleInput, self).__init__()  
+        self.conv1 = nn.Conv2d(in_shape[0], 16, kernel_size=3, padding=1)  
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)  
+        self.dropout = nn.Dropout(0.3)  
+        self.layer_norm = nn.LayerNorm([32, in_shape[1], in_shape[2]])  # Replace BatchNorm2d
+        self.flatten = nn.Flatten()  
+        self.fc1 = nn.Linear(32 * in_shape[1] * in_shape[2], 512)  
+        self.fc2 = nn.Linear(512, n_keypoints)  
+        self.fc_ln = nn.LayerNorm(512)  # Replace BatchNorm1d
+        self.fc_dropout = nn.Dropout(0.4)  
+  
+    def forward(self, x):
+        # For radar data, we need to permute the dimensions
+        if x.shape[1] == 14 and x.shape[3] == 5:
+            x = x.permute(0, 3, 1, 2)  # Change from (B, H, W, C) to (B, C, H, W)
+        x = torch.relu(self.conv1(x))  
+        x = self.dropout(x)  
+        x = torch.relu(self.conv2(x))  
+        x = self.dropout(x)  
+        x = self.layer_norm(x)  
+        x = self.flatten(x)  
+        x = torch.relu(self.fc1(x))  
+        x = self.fc_ln(x)  
+        x = self.fc_dropout(x)  
+        x = self.fc2(x)  
+        return x  
 
-# Define the CNN model  
-class CNN(nn.Module):
+# Define the multi modal CNN model  
+class CNNMultiInput(nn.Module):
     def __init__(self, rgb_shape, radar_shape, n_keypoints):
-        super(CNN, self).__init__()
+        super(CNNMultiInput, self).__init__()
         
         # RGB branch
         self.rgb_conv1 = nn.Conv2d(rgb_shape[0], 16, kernel_size=3, padding=1)
@@ -349,13 +405,6 @@ class CNN(nn.Module):
         x = self.fc_dropout(x)
         x = self.fc2(x)
         return x
-    
-def custom_collate(batch):
-    frames, radars, labels = zip(*batch)
-    frames = torch.stack(frames).float()
-    radars = torch.stack(radars).float()
-    labels = torch.stack(labels).float()
-    return frames, radars, labels
 
 
 if __name__ == "__main__":
@@ -363,7 +412,9 @@ if __name__ == "__main__":
     video_dirs = "/home/ubuntu/gdrive/workspace/blurred_videos/"
     radar_dirs = "/home/ubuntu/gdrive/workspace/dataset_release/features/radar/"
     cache_dir = '/home/ubuntu/MARS-RGB-Radar-cache-npy'
-    output_direct = 'model_mri_pytorch-RGB-Radar-Gray-e200-160/'
+    output_direct = 'model_mri_pytorch-Radar-e200-normalized/'
+
+    input_type = "radar"  # Can be "video", "radar", or "both"
 
     # Set PYTORCH_CUDA_ALLOC_CONF
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
@@ -380,6 +431,21 @@ if __name__ == "__main__":
     # Define epochs and iterations
     epochs = 200
     iters = 1
+
+    # Modify custom_collate function based on input_type
+    def custom_collate(batch):
+        frames, radars, labels = zip(*batch)
+        labels = torch.stack(labels).float()
+        if input_type == "video":
+            frames = torch.stack(frames).float()
+            return frames, labels
+        elif input_type == "radar":
+            radars = torch.stack(radars).float()
+            return radars, labels
+        else:  # both
+            frames = torch.stack(frames).float()
+            radars = torch.stack(radars).float()
+            return frames, radars, labels
 
     full_dataset = MARSDatasetChunked(
         label_dirs, 
@@ -433,8 +499,13 @@ if __name__ == "__main__":
     # Repeat i iteration to get the average result
     for iter in range(iters):
         print(f"Iteration {iter}")
-        # Instantiate the model
-        model = CNN(rgb_shape, radar_shape, n_keypoints)
+        # Instantiate the model based on input_type
+        if input_type == "video":
+            model = CNNSingleInput(rgb_shape, n_keypoints)
+        elif input_type == "radar":
+            model = CNNSingleInput((radar_shape[2], radar_shape[0], radar_shape[1]), n_keypoints)
+        else:  # both
+            model = CNNMultiInput(rgb_shape, radar_shape, n_keypoints)
         model = model.cuda() if torch.cuda.is_available() else model
 
         best_val_loss = float('inf')
@@ -459,11 +530,17 @@ if __name__ == "__main__":
             print(f"Epoch {epoch+1}/{epochs}")
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
-                for i, (batch_rgb, batch_radar, batch_labels) in enumerate(tqdm(train_loader)):
-                    batch_rgb, batch_radar, batch_labels = batch_rgb.cuda(non_blocking=True), batch_radar.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_rgb, batch_radar, batch_labels)
+                for i, batch in enumerate(tqdm(train_loader)):
+                    if input_type == "both":
+                        batch_rgb, batch_radar, batch_labels = [b.cuda(non_blocking=True) if torch.cuda.is_available() else b for b in batch]
+                    else:
+                        batch_data, batch_labels = [b.cuda(non_blocking=True) if torch.cuda.is_available() else b for b in batch]
         
                     with amp.autocast():
-                        outputs = model(batch_rgb, batch_radar)
+                        if input_type == "both":
+                            outputs = model(batch_rgb, batch_radar)
+                        else:
+                            outputs = model(batch_data)
                         loss = criterion(outputs, batch_labels)
 
                     scaler.scale(loss).backward()
@@ -487,10 +564,16 @@ if __name__ == "__main__":
                 val_mae = 0
                 print("Validation")
                 with torch.no_grad():
-                    for batch_rgb, batch_radar, batch_labels in tqdm(test_loader):
-                        batch_rgb, batch_radar, batch_labels = batch_rgb.cuda(non_blocking=True), batch_radar.cuda(non_blocking=True), batch_labels.cuda(non_blocking=True) if torch.cuda.is_available() else (batch_rgb, batch_radar, batch_labels)
+                    for batch in tqdm(test_loader):
+                        if input_type == "both":
+                            batch_rgb, batch_radar, batch_labels = [b.cuda(non_blocking=True) if torch.cuda.is_available() else b for b in batch]
+                        else:
+                            batch_data, batch_labels = [b.cuda(non_blocking=True) if torch.cuda.is_available() else b for b in batch]
                         with amp.autocast():
-                            outputs = model(batch_rgb, batch_radar)
+                            if input_type == "both":
+                                outputs = model(batch_rgb, batch_radar)
+                            else:
+                                outputs = model(batch_data)
                             val_loss += criterion(outputs, batch_labels).item()
                             val_mae += torch.mean(torch.abs(outputs - batch_labels)).item()
 
@@ -519,9 +602,13 @@ if __name__ == "__main__":
         all_labels = []
 
         with torch.no_grad():
-            for batch_rgb, batch_radar, batch_labels in tqdm(test_loader, desc="Evaluating best model"):
-                batch_rgb, batch_radar, batch_labels = batch_rgb.cuda(), batch_radar.cuda(), batch_labels.cuda() if torch.cuda.is_available() else (batch_rgb, batch_radar, batch_labels)
-                outputs = model(batch_rgb, batch_radar)
+            for batch in tqdm(test_loader, desc="Evaluating best model"):
+                if input_type == "both":
+                    batch_rgb, batch_radar, batch_labels = [b.cuda() if torch.cuda.is_available() else b for b in batch]
+                    outputs = model(batch_rgb, batch_radar)
+                else:
+                    batch_data, batch_labels = [b.cuda() if torch.cuda.is_available() else b for b in batch]
+                    outputs = model(batch_data)
                 all_outputs.append(outputs.cpu().numpy())
                 all_labels.append(batch_labels.cpu().numpy())
 
@@ -548,11 +635,7 @@ if __name__ == "__main__":
         plt.xlabel('Epoch')  
         plt.grid()  
         plt.legend(['Train', 'Validation'], loc='upper left')  
-        plt.savefig(output_direct + f"/loss-{iter}.png")  
-
-        # Before calculating metrics, move tensors to CPU and convert to NumPy arrays
-        # all_labels = all_labels.cpu().numpy()
-        # all_outputs = all_outputs.cpu().numpy()
+        plt.savefig(output_direct + f"/loss-{iter}.png")
     
         # Error for each axis  
         print("mae for x is", metrics.mean_absolute_error(all_labels[:, 0:17], all_outputs[:, 0:17]))  
