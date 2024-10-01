@@ -165,6 +165,5 @@ cython_debug/
 
 blurred_videos/
 dataset_release/
-model/
 blurred_videos*
-model*
+results/
