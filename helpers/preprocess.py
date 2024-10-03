@@ -265,16 +265,28 @@ class MARSDatasetChunked(Dataset):
     @staticmethod
     def _preprocess_frames(frame_pair, target_size):
         jpeg = turbojpeg.TurboJPEG()
-        frame0 = MARSDatasetChunked._read_and_transform(frame_pair[0], jpeg, target_size)
-        frame1 = MARSDatasetChunked._read_and_transform(frame_pair[1], jpeg, target_size)
-        return np.concatenate((frame0, frame1), axis=0)
+        try:
+            frame0 = MARSDatasetChunked._read_and_transform(frame_pair[0], jpeg, target_size)
+            frame1 = MARSDatasetChunked._read_and_transform(frame_pair[1], jpeg, target_size)
+            return np.concatenate((frame0, frame1), axis=0)
+        except Exception as e:
+            print(f"Error preprocessing frames: {frame_pair}")
+            print(f"Error details: {str(e)}")
+            raise
 
     @staticmethod
     def _read_and_transform(frame_path, jpeg, target_size):
-        with open(frame_path, 'rb') as in_file:
-            frame = jpeg.decode(in_file.read(), pixel_format=turbojpeg.TJPF_GRAY)
-        frame = cv2.resize(frame, target_size)
-        return frame.reshape(1, *target_size).astype(np.float32) / 255.0
+        try:
+            with open(frame_path, 'rb') as in_file:
+                frame = jpeg.decode(in_file.read(), pixel_format=turbojpeg.TJPF_GRAY)
+            frame = cv2.resize(frame, target_size)
+            return frame.reshape(1, *target_size).astype(np.float32) / 255.0
+        except OSError as e:
+            print(f"Error reading file: {frame_path}")
+            print(f"File exists: {os.path.exists(frame_path)}")
+            print(f"File size: {os.path.getsize(frame_path) if os.path.exists(frame_path) else 'N/A'}")
+            print(f"Error details: {str(e)}")
+            raise
 
     def __len__(self):
         return len(self.frames)

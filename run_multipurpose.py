@@ -18,6 +18,7 @@ from module.models.CNNKAN import CNNKANSingleInput, CNNKANMultiInput
 
 from helpers.preprocess import MARSDatasetChunked, ChunkSampler
 from helpers.args import run_multipurpose
+from helpers.checkers import estimate_gpu_memory_usage
 
 if __name__ == "__main__":
     # label_dirs = "/home/ubuntu/gdrive/workspace/dataset_release/aligned_data/pose_labels/"
@@ -165,6 +166,24 @@ if __name__ == "__main__":
         val_mae_history = []
         train_loss_history = []
         val_loss_history = []
+
+        # Before training, estimate memory usage
+        if input_type == "video":
+            input_shape = rgb_shape
+        elif input_type == "radar":
+            input_shape = (radar_shape[2], radar_shape[0], radar_shape[1])
+        else:  # both
+            input_shape = (rgb_shape, radar_shape)
+
+        estimated_memory = estimate_gpu_memory_usage(model, input_shape, batch_size)
+        
+        # Check if estimated memory exceeds available GPU memory
+        available_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # in GB
+        if estimated_memory > available_memory:
+            print(f"Warning: Estimated memory usage ({estimated_memory:.2f} GB) exceeds available GPU memory ({available_memory:.2f} GB)")
+            print("Consider reducing batch size or model complexity")
+        else:
+            print(f"Estimated memory usage ({estimated_memory:.2f} GB) is within available GPU memory ({available_memory:.2f} GB)")
 
         # Training loop
         for epoch in range(epochs):
